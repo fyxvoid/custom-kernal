@@ -1,0 +1,109 @@
+#!/bin/sh
+# SecureKernel init script
+# Runs inside the QEMU initramfs as PID 1
+
+# Mount virtual filesystems
+mount -t proc     proc     /proc
+mount -t sysfs    sysfs    /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || mdev -s
+
+# Set hostname
+hostname securekernel
+
+# Banner
+echo ""
+echo "============================================================"
+echo "  SecureKernel — Linux 6.6 LTS Custom Hardened Kernel"
+echo "  IT B TEAM 7 — Gnanamani College of Technology"
+echo "============================================================"
+echo ""
+echo "  Module 1: Kernel Lightening     (SCPA) — compile-time"
+echo "  Module 2: Memory Optimization   (MMOA) — built-in"
+echo "  Module 3: Network Packet Filter (RBPF) — built-in"
+echo "  Module 4: Access Control LSM    (ACM)  — built-in"
+echo "============================================================"
+echo ""
+
+# Show kernel version
+echo "[*] Kernel: $(uname -r)"
+echo "[*] LSM list:"
+cat /sys/kernel/security/lsm 2>/dev/null && echo || \
+    grep . /proc/sys/kernel/lsm 2>/dev/null && echo || \
+    dmesg | grep -i "lsm\|ACM LSM\|MMOA\|RBPF" | grep -v "^\[" | cat
+echo ""
+
+# Show MMOA stats
+echo "[*] MMOA memory optimisation:"
+if [ -f /proc/mmoa_stats ]; then
+    grep -m10 "" /proc/mmoa_stats
+else
+    echo "    /proc/mmoa_stats not available — check dmesg"
+fi
+echo ""
+
+# Show RBPF status
+echo "[*] RBPF packet filter:"
+if [ -f /proc/rbpf_rules ]; then
+    cat /proc/rbpf_rules
+else
+    echo "    /proc/rbpf_rules not available"
+fi
+echo ""
+
+# Show ACM policy
+echo "[*] ACM MAC policy:"
+if [ -f /proc/acm_policy ]; then
+    cat /proc/acm_policy
+else
+    echo "    /proc/acm_policy not available"
+fi
+echo ""
+
+# Show memory info
+echo "[*] Memory:"
+free 2>/dev/null || cat /proc/meminfo | grep -E "MemTotal|MemFree|MemAvail"
+echo ""
+echo "[*] vm.swappiness = $(cat /proc/sys/vm/swappiness)"
+echo ""
+
+# Demo: add an RBPF rule
+if [ -f /proc/rbpf_rules ]; then
+    echo "[*] Demo: adding RBPF ACCEPT rule for loopback + SSH port 22 ..."
+    echo "ADD 10 0.0.0.0/0 0.0.0.0/0 0-0 22-22 tcp accept" > /proc/rbpf_rules
+    echo "ADD 20 0.0.0.0/0 0.0.0.0/0 0-0 80-80 tcp accept" > /proc/rbpf_rules
+    echo "    Updated rules:"
+    cat /proc/rbpf_rules
+    echo ""
+fi
+
+# Demo: add ACM policy entry
+if [ -f /proc/acm_policy ]; then
+    echo "[*] Demo: adding ACM ALLOW rule for 'demo' process ..."
+    echo "LABEL demo" > /proc/acm_policy
+    echo "ALLOW demo default read,write,exec,net" > /proc/acm_policy
+    echo "    Updated policy:"
+    cat /proc/acm_policy
+    echo ""
+fi
+
+# MMOA control demo
+if [ -f /proc/mmoa_control ]; then
+    echo "[*] Demo: tuning MMOA frag_threshold to 15% ..."
+    echo "frag_threshold 15" > /proc/mmoa_control
+fi
+
+echo ""
+echo "============================================================"
+echo "  SecureKernel is running! Type commands below."
+echo "  Try: dmesg | grep -E 'ACM|MMOA|RBPF|SCPA'"
+echo "       cat /proc/mmoa_stats"
+echo "       cat /proc/rbpf_rules"
+echo "       cat /proc/acm_policy"
+echo "       uname -a"
+echo "       free"
+echo "  Press Ctrl-A X to quit QEMU"
+echo "============================================================"
+echo ""
+
+# Drop into interactive shell
+exec /bin/sh

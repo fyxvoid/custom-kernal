@@ -1,0 +1,69 @@
+# ── Kernel source tree (large — not committed) ────────────────────────────────
+linux-build/linux-6.6.140/
+linux-build/linux-6.6.140/**
+linux-build/linux-6.6.140/.*
+linux-build/*.tar.xz
+linux-build/*.tar.gz
+linux-build/build*.log
+
+# ── Compiled kernel artefacts ─────────────────────────────────────────────────
+*.o
+*.a
+*.ko
+*.mod
+*.mod.c
+*.order
+*.symvers
+modules.builtin
+modules.builtin.modinfo
+Module.symvers
+Module.markers
+
+# ── Kernel build outputs ──────────────────────────────────────────────────────
+vmlinux
+vmlinux.o
+vmlinux.a
+bzImage
+zImage
+uImage
+System.map
+.tmp_*
+.cache.mk
+.version
+
+# ── Initramfs packed image and binary contents ────────────────────────────────
+linux-build/initramfs.cpio.gz
+linux-build/initramfs/bin/**
+linux-build/initramfs/lib/**
+linux-build/initramfs/lib64/**
+linux-build/initramfs/sbin/**
+
+# ── Kernel config scratch files ───────────────────────────────────────────────
+linux-build/patches/**
+
+# ── Benchmark results (machine-specific) ──────────────────────────────────────
+benchmarks/results/**
+
+# ── SCPA script outputs ───────────────────────────────────────────────────────
+module1_kernel_lightening/hardened.config
+module1_kernel_lightening/scpa_*.log
+
+# ── Editor and IDE ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.*.swp
+
+# ── OS artefacts ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── LibreOffice lock files ────────────────────────────────────────────────────
+.~lock.*
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
