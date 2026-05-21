@@ -1,11 +1,11 @@
 #!/bin/sh
-# SecureKernel init script
-# Runs inside the QEMU initramfs as PID 1
+# SecureKernel init script — runs inside QEMU initramfs as PID 1
 
 # Mount virtual filesystems
 mount -t proc     proc     /proc
 mount -t sysfs    sysfs    /sys
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || mdev -s
+mount -t tmpfs    tmpfs    /tmp
 
 # Set hostname
 hostname securekernel
@@ -13,36 +13,40 @@ hostname securekernel
 # Banner
 echo ""
 echo "============================================================"
-echo "  SecureKernel — Linux 6.6 LTS Custom Hardened Kernel"
-echo "  IT B TEAM 7 — Gnanamani College of Technology"
+echo "  SecureKernel -- Linux 6.6 LTS Custom Hardened Kernel"
+echo "  IT B TEAM 7 -- Gnanamani College of Technology"
 echo "============================================================"
 echo ""
-echo "  Module 1: Kernel Lightening     (SCPA) — compile-time"
-echo "  Module 2: Memory Optimization   (MMOA) — built-in"
-echo "  Module 3: Network Packet Filter (RBPF) — built-in"
-echo "  Module 4: Access Control LSM    (ACM)  — built-in"
+echo "  Module 1: Kernel Lightening     (SCPA) -- compile-time"
+echo "  Module 2: Memory Optimization   (MMOA) -- built-in"
+echo "  Module 3: Network Packet Filter (RBPF) -- built-in"
+echo "  Module 4: Access Control LSM    (ACM)  -- built-in"
 echo "============================================================"
 echo ""
 
-# Show kernel version
+# Kernel version + LSM list
 echo "[*] Kernel: $(uname -r)"
-echo "[*] LSM list:"
-cat /sys/kernel/security/lsm 2>/dev/null && echo || \
-    grep . /proc/sys/kernel/lsm 2>/dev/null && echo || \
-    dmesg | grep -i "lsm\|ACM LSM\|MMOA\|RBPF" | grep -v "^\[" | cat
+echo "[*] Active LSMs:"
+if [ -f /sys/kernel/security/lsm ]; then
+    echo "    $(cat /sys/kernel/security/lsm)"
+elif [ -f /proc/sys/kernel/lsm ]; then
+    echo "    $(cat /proc/sys/kernel/lsm)"
+else
+    dmesg 2>/dev/null | grep -iE "lsm:|security:.*registered" | head -5 || true
+fi
 echo ""
 
-# Show MMOA stats
+# ── Module 2: MMOA ───────────────────────────────────────────────────────────
 echo "[*] MMOA memory optimisation:"
 if [ -f /proc/mmoa_stats ]; then
     grep -m10 "" /proc/mmoa_stats
 else
-    echo "    /proc/mmoa_stats not available — check dmesg"
+    echo "    /proc/mmoa_stats not available -- check dmesg"
 fi
 echo ""
 
-# Show RBPF status
-echo "[*] RBPF packet filter:"
+# ── Module 3: RBPF ───────────────────────────────────────────────────────────
+echo "[*] RBPF packet filter (initial rules):"
 if [ -f /proc/rbpf_rules ]; then
     cat /proc/rbpf_rules
 else
@@ -50,7 +54,7 @@ else
 fi
 echo ""
 
-# Show ACM policy
+# ── Module 4: ACM ────────────────────────────────────────────────────────────
 echo "[*] ACM MAC policy:"
 if [ -f /proc/acm_policy ]; then
     cat /proc/acm_policy
@@ -59,49 +63,129 @@ else
 fi
 echo ""
 
-# Show memory info
+# ── Memory ───────────────────────────────────────────────────────────────────
 echo "[*] Memory:"
-free 2>/dev/null || cat /proc/meminfo | grep -E "MemTotal|MemFree|MemAvail"
-echo ""
+free 2>/dev/null || grep -E "MemTotal|MemFree|MemAvailable" /proc/meminfo
 echo "[*] vm.swappiness = $(cat /proc/sys/vm/swappiness)"
 echo ""
 
-# Demo: add an RBPF rule
+# ── RBPF demo rules ──────────────────────────────────────────────────────────
 if [ -f /proc/rbpf_rules ]; then
-    echo "[*] Demo: adding RBPF ACCEPT rule for loopback + SSH port 22 ..."
-    echo "ADD 10 0.0.0.0/0 0.0.0.0/0 0-0 22-22 tcp accept" > /proc/rbpf_rules
-    echo "ADD 20 0.0.0.0/0 0.0.0.0/0 0-0 80-80 tcp accept" > /proc/rbpf_rules
-    echo "    Updated rules:"
+    echo "[*] Demo: loading RBPF firewall rules ..."
+    echo "ADD 10 0.0.0.0/0 0.0.0.0/0 0-0 22-22 tcp accept"  > /proc/rbpf_rules
+    echo "ADD 20 0.0.0.0/0 0.0.0.0/0 0-0 80-80 tcp accept"  > /proc/rbpf_rules
+    echo "ADD 30 0.0.0.0/0 0.0.0.0/0 0-0 443-443 tcp accept" > /proc/rbpf_rules
+    echo "    Rules loaded:"
     cat /proc/rbpf_rules
     echo ""
 fi
 
-# Demo: add ACM policy entry
+# ── ACM demo policy ──────────────────────────────────────────────────────────
 if [ -f /proc/acm_policy ]; then
-    echo "[*] Demo: adding ACM ALLOW rule for 'demo' process ..."
-    echo "LABEL demo" > /proc/acm_policy
-    echo "ALLOW demo default read,write,exec,net" > /proc/acm_policy
-    echo "    Updated policy:"
+    echo "[*] Demo: loading ACM policy ..."
+    echo "LABEL demo"                                    > /proc/acm_policy
+    echo "ALLOW demo default read,write,exec,net"       > /proc/acm_policy
+    echo "    Policy loaded:"
     cat /proc/acm_policy
     echo ""
 fi
 
-# MMOA control demo
+# ── MMOA tuning ──────────────────────────────────────────────────────────────
 if [ -f /proc/mmoa_control ]; then
     echo "[*] Demo: tuning MMOA frag_threshold to 15% ..."
     echo "frag_threshold 15" > /proc/mmoa_control
+    echo ""
 fi
 
+# ── Network setup + demo ─────────────────────────────────────────────────────
+echo "============================================================"
+echo "  Network Demo"
+echo "============================================================"
 echo ""
+
+# Bring up loopback first
+ip link set lo up 2>/dev/null || ifconfig lo 127.0.0.1 up 2>/dev/null || true
+
+# Detect the virtio/ethernet interface (QEMU user-net appears as eth0)
+NET_IF=""
+for iface in eth0 ens3 ens4 ens5 virtio0; do
+    [ -d "/sys/class/net/$iface" ] && { NET_IF="$iface"; break; }
+done
+# Fallback: first non-loopback interface
+if [ -z "$NET_IF" ]; then
+    NET_IF=$(ls /sys/class/net/ 2>/dev/null | grep -v "^lo$" | head -1)
+fi
+
+if [ -n "$NET_IF" ]; then
+    echo "[*] Network interface: $NET_IF"
+    ip link set "$NET_IF" up 2>/dev/null || ifconfig "$NET_IF" up 2>/dev/null || true
+
+    # QEMU user-mode networking: guest=10.0.2.15, gw=10.0.2.2, dns=10.0.2.3
+    ip addr add 10.0.2.15/24 dev "$NET_IF" 2>/dev/null || \
+        ifconfig "$NET_IF" 10.0.2.15 netmask 255.255.255.0 2>/dev/null || true
+    ip route add default via 10.0.2.2 2>/dev/null || \
+        route add default gw 10.0.2.2 2>/dev/null || true
+
+    echo "[*] IP address : 10.0.2.15/24"
+    echo "[*] Gateway    : 10.0.2.2  (QEMU host)"
+    echo "[*] DNS        : 10.0.2.3"
+    echo ""
+
+    # Show interface details
+    ip addr show "$NET_IF" 2>/dev/null || ifconfig "$NET_IF" 2>/dev/null || true
+    echo ""
+
+    # ── Ping demo ────────────────────────────────────────────────────────────
+    echo "[*] Ping test -- QEMU gateway (10.0.2.2) ..."
+    if ping -c 4 -W 2 10.0.2.2 2>/dev/null; then
+        echo "    [PASS] Network is up and reachable!"
+    else
+        echo "    [INFO] ICMP ping blocked or interface not ready."
+        echo "           Try manually: ping -c 3 10.0.2.2"
+    fi
+    echo ""
+
+    # ── Loopback ping ────────────────────────────────────────────────────────
+    echo "[*] Ping test -- loopback (127.0.0.1) ..."
+    if ping -c 2 -W 1 127.0.0.1 2>/dev/null; then
+        echo "    [PASS] Loopback OK"
+    else
+        echo "    [INFO] Loopback ping returned non-zero (may still work)"
+    fi
+    echo ""
+
+    # ── RBPF: show network filtering is active ────────────────────────────────
+    if [ -f /proc/rbpf_rules ]; then
+        echo "[*] RBPF: current rules protecting the network stack:"
+        cat /proc/rbpf_rules
+        echo ""
+    fi
+else
+    echo "[WARN] No ethernet interface found."
+    echo "       Network demo unavailable -- check kernel virtio_net config."
+    echo ""
+fi
+
 echo "============================================================"
 echo "  SecureKernel is running! Type commands below."
-echo "  Try: dmesg | grep -E 'ACM|MMOA|RBPF|SCPA'"
-echo "       cat /proc/mmoa_stats"
-echo "       cat /proc/rbpf_rules"
-echo "       cat /proc/acm_policy"
-echo "       uname -a"
-echo "       free"
-echo "  Press Ctrl-A X to quit QEMU"
+echo ""
+echo "  Kernel module demos:"
+echo "    dmesg | grep -E 'ACM|MMOA|RBPF|SCPA'"
+echo "    cat /proc/mmoa_stats"
+echo "    cat /proc/rbpf_rules"
+echo "    cat /proc/acm_policy"
+echo ""
+echo "  Network commands:"
+echo "    ping -c 3 10.0.2.2          # ping QEMU gateway"
+echo "    ping -c 3 127.0.0.1         # loopback"
+echo "    ip addr                     # show interfaces"
+echo "    ip route                    # show routing table"
+echo "    cat /proc/net/dev           # network stats"
+echo "    cat /proc/net/if_inet6      # IPv6 info"
+echo ""
+echo "  System:"
+echo "    uname -a   free   df   ps   dmesg"
+echo "  Press Ctrl-A then X to quit QEMU"
 echo "============================================================"
 echo ""
 

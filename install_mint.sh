@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
 # =============================================================================
-# SecureKernel — One-shot setup & launch script for Debian-based systems
+# SecureKernel — Linux Mint (and Ubuntu-based) Installer
 # =============================================================================
 #
-# What this script does, in order:
-#   1. Detects if running on a Debian/Ubuntu/Kali/Mint system
-#   2. Installs all build and runtime dependencies
-#   3. Downloads Linux 6.6.140 LTS source (if not already present)
-#   4. Patches the kernel source with all four SecureKernel modules
-#   5. Configures and compiles the kernel (SCPA hardened config)
-#   6. Builds a minimal busybox initramfs
-#   7. Boots the finished kernel in QEMU with a serial TTY
+# One-shot script that installs ALL build dependencies, compiles the
+# Linux 6.6.140 LTS kernel with SecureKernel modules, builds a minimal
+# initramfs, and boots the result inside QEMU.
+#
+# Tested on:
+#   Linux Mint 21.x / 22.x (Ubuntu 22.04 / 24.04 base)
+#   Ubuntu 22.04 LTS, 24.04 LTS
+#   Pop!_OS 22.04
 #
 # Usage:
-#   chmod +x setup.sh
-#   ./setup.sh
+#   chmod +x install_mint.sh
+#   ./install_mint.sh
 #
-# On subsequent runs the script skips already-completed steps automatically.
+# To skip the QEMU boot and just build:
+#   NO_QEMU=1 ./install_mint.sh
 #
 # Press Ctrl-A then X inside QEMU to quit.
 # =============================================================================
@@ -34,7 +35,6 @@ banner() {
     echo -e "${BOLD}${CYN}============================================================${NC}"
     echo ""
 }
-
 step()  { echo -e "${BLU}[STEP]${NC} $*"; }
 ok()    { echo -e "${GRN}[ OK ]${NC} $*"; }
 warn()  { echo -e "${YLW}[WARN]${NC} $*"; }
@@ -51,83 +51,144 @@ CPIO="$BUILD_DIR/initramfs.cpio.gz"
 BZIMAGE="$KSRC/arch/x86/boot/bzImage"
 JOBS=$(nproc)
 
-# ── Banner ────────────────────────────────────────────────────────────────────
-banner "SecureKernel Setup — Linux 6.6.140 LTS"
+banner "SecureKernel — Linux Mint Installer (Linux 6.6.140 LTS)"
 echo -e "  Script dir : ${BOLD}$SCRIPT_DIR${NC}"
 echo -e "  Build dir  : ${BOLD}$BUILD_DIR${NC}"
 echo -e "  CPU cores  : ${BOLD}$JOBS${NC}"
 echo ""
 
 # =============================================================================
-# STEP 1 — Detect distro
+# STEP 1 — Detect distro (Linux Mint compatible)
 # =============================================================================
 banner "Step 1 — Detecting distribution"
 
-if [[ ! -f /etc/os-release ]]; then
-    die "Cannot detect OS — /etc/os-release not found."
-fi
+[[ -f /etc/os-release ]] || die "Cannot detect OS — /etc/os-release not found."
 source /etc/os-release
 
-case "${ID_LIKE:-$ID}" in
-    *debian*|*ubuntu*)
-        ok "Detected Debian-based system: $PRETTY_NAME"
-        PKG_MGR="apt-get"
-        ;;
-    *)
-        die "This script supports Debian/Ubuntu/Kali/Mint only. Detected: ${PRETTY_NAME:-unknown}"
-        ;;
-esac
+# Linux Mint sets ID=linuxmint and ID_LIKE=ubuntu — handle both
+DISTRO_OK=0
+[[ "${ID:-}"      =~ ^(debian|ubuntu|linuxmint|pop|elementary|zorin|kali)$ ]] && DISTRO_OK=1
+[[ "${ID_LIKE:-}" =~ (debian|ubuntu) ]]                                        && DISTRO_OK=1
+
+[[ $DISTRO_OK -eq 1 ]] || \
+    die "Unsupported OS: ${PRETTY_NAME:-unknown}. This script targets Debian/Ubuntu/Mint."
+
+ok "Detected: ${PRETTY_NAME:-$ID}"
+
+# Ubuntu/Mint version for package name differences
+UBUNTU_VER="0"
+if [[ -n "${UBUNTU_CODENAME:-}" ]]; then
+    UBUNTU_VER="${UBUNTU_CODENAME}"
+fi
 
 # =============================================================================
-# STEP 2 — Install dependencies
+# STEP 2 — Install ALL build dependencies
 # =============================================================================
-banner "Step 2 — Installing dependencies"
+banner "Step 2 — Installing build dependencies"
 
+# Comprehensive list — covers Mint 21/22 (Ubuntu 22.04/24.04 base)
 DEPS=(
-    # Kernel build essentials
-    build-essential gcc g++ make bc
-    bison flex libssl-dev libelf-dev
-    # Needed for newer kernels / GCC plugins
-    libncurses-dev libgmp-dev libmpc-dev libmpfr-dev
+    # Core toolchain
+    build-essential gcc g++ make binutils
+    # Kernel build requirements
+    bc bison flex
+    libssl-dev libelf-dev
+    libncurses-dev libncurses5-dev
+    # GCC plugins (required by newer kernels)
+    libgmp-dev libmpc-dev libmpfr-dev
     # Compression libraries
-    zlib1g-dev libzstd-dev liblz4-tool
-    # Pahole for BTF (optional but prevents config warnings)
+    zlib1g-dev libzstd-dev
+    liblz4-tool lz4
+    # Pahole / BTF (dwarves provides pahole)
     dwarves
-    # Build helpers
-    pkg-config rsync openssl
-    # Archive & download
-    cpio gzip xz-utils wget curl
+    # Archive & download tools
+    cpio gzip xz-utils tar wget curl
+    # Kernel signing / certs (needed even when disabled, for headers)
+    openssl
+    # Build system helpers
+    pkg-config rsync
+    # Python (used by kernel scripts)
+    python3
+    # File utilities
+    file kmod
     # QEMU
     qemu-system-x86
-    # Busybox for initramfs (static preferred)
+    # BusyBox for initramfs
     busybox-static
-    # Misc
-    python3 file kmod
 )
 
+# apt-get may not know busybox-static on some versions; fallback to busybox
 MISSING=()
 for pkg in "${DEPS[@]}"; do
-    dpkg -s "$pkg" &>/dev/null || MISSING+=("$pkg")
+    dpkg -s "$pkg" &>/dev/null 2>&1 || MISSING+=("$pkg")
 done
 
 if [[ ${#MISSING[@]} -eq 0 ]]; then
     ok "All dependencies already installed."
 else
-    step "Installing: ${MISSING[*]}"
+    step "Updating package lists ..."
     if [[ $EUID -ne 0 ]]; then
-        sudo $PKG_MGR update -qq
-        sudo $PKG_MGR install -y "${MISSING[@]}"
+        sudo apt-get update -qq
     else
-        $PKG_MGR update -qq
-        $PKG_MGR install -y "${MISSING[@]}"
+        apt-get update -qq
+    fi
+
+    step "Installing ${#MISSING[@]} package(s): ${MISSING[*]}"
+    FAILED_PKGS=()
+    for pkg in "${MISSING[@]}"; do
+        if [[ $EUID -ne 0 ]]; then
+            sudo apt-get install -y "$pkg" 2>/dev/null || FAILED_PKGS+=("$pkg")
+        else
+            apt-get install -y "$pkg" 2>/dev/null || FAILED_PKGS+=("$pkg")
+        fi
+    done
+
+    if [[ ${#FAILED_PKGS[@]} -gt 0 ]]; then
+        warn "Could not install (may not exist on this release): ${FAILED_PKGS[*]}"
+        # Try alternatives
+        for pkg in "${FAILED_PKGS[@]}"; do
+            case "$pkg" in
+                busybox-static)
+                    step "Trying 'busybox' as fallback ..."
+                    if [[ $EUID -ne 0 ]]; then sudo apt-get install -y busybox 2>/dev/null || true
+                    else apt-get install -y busybox 2>/dev/null || true; fi
+                    ;;
+                libncurses-dev)
+                    step "Trying 'libncurses5-dev' ..."
+                    if [[ $EUID -ne 0 ]]; then sudo apt-get install -y libncurses5-dev 2>/dev/null || true
+                    else apt-get install -y libncurses5-dev 2>/dev/null || true; fi
+                    ;;
+                liblz4-tool)
+                    step "Trying 'lz4' ..."
+                    if [[ $EUID -ne 0 ]]; then sudo apt-get install -y lz4 2>/dev/null || true
+                    else apt-get install -y lz4 2>/dev/null || true; fi
+                    ;;
+            esac
+        done
     fi
     ok "Dependencies installed."
 fi
 
-# Verify QEMU is usable
+# Locate busybox (static preferred)
+BUSYBOX_BIN=""
+for b in /usr/bin/busybox /bin/busybox /usr/lib/busybox/busybox-x86_64; do
+    [[ -x "$b" ]] && { BUSYBOX_BIN="$b"; break; }
+done
+[[ -n "$BUSYBOX_BIN" ]] || die "busybox not found after installation. Try: sudo apt-get install busybox-static"
+ok "BusyBox: $BUSYBOX_BIN"
+
+# Verify QEMU
 QEMU_BIN=$(command -v qemu-system-x86_64 2>/dev/null) || \
-    die "qemu-system-x86_64 not found after installation."
+    die "qemu-system-x86_64 not found. Try: sudo apt-get install qemu-system-x86"
 ok "QEMU: $QEMU_BIN ($($QEMU_BIN --version | head -1))"
+
+# Verify pahole (needed for CONFIG_DEBUG_INFO_BTF even when disabled)
+PAHOLE_BIN=$(command -v pahole 2>/dev/null || true)
+if [[ -z "$PAHOLE_BIN" ]]; then
+    warn "pahole not found — CONFIG_DEBUG_INFO_BTF will be forcibly disabled."
+else
+    ok "pahole: $PAHOLE_BIN ($(pahole --version 2>&1 | head -1))"
+fi
 
 # =============================================================================
 # STEP 3 — Download kernel source
@@ -141,7 +202,8 @@ if [[ -d "$KSRC" && -f "$KSRC/Makefile" ]]; then
 else
     if [[ ! -f "$KTARBALL" ]]; then
         step "Downloading Linux 6.6.140 (~141 MB) ..."
-        wget -q --show-progress "$KURL" -O "$KTARBALL"
+        wget -q --show-progress "$KURL" -O "$KTARBALL" || \
+            curl -L --progress-bar "$KURL" -o "$KTARBALL"
         ok "Downloaded: $(du -sh "$KTARBALL" | cut -f1)"
     else
         ok "Tarball already present: $(du -sh "$KTARBALL" | cut -f1)"
@@ -177,13 +239,11 @@ EOF
 
     echo 'obj-$(CONFIG_SECURITY_ACM) += acm_lsm.o' > "$target/Makefile"
 
-    # Patch security/Kconfig
     if ! grep -q "security/acm/Kconfig" "$KSRC/security/Kconfig"; then
         sed -i 's|source "security/Kconfig.hardening"|source "security/acm/Kconfig"\nsource "security/Kconfig.hardening"|' \
             "$KSRC/security/Kconfig"
     fi
 
-    # Patch security/Makefile
     if ! grep -q "CONFIG_SECURITY_ACM" "$KSRC/security/Makefile"; then
         sed -i 's|obj-$(CONFIG_SECURITY_LANDLOCK).*+= landlock/|&\nobj-$(CONFIG_SECURITY_ACM)\t\t+= acm/|' \
             "$KSRC/security/Makefile"
@@ -260,7 +320,7 @@ patch_rbpf
 patch_mmoa
 
 # =============================================================================
-# STEP 5 — Configure kernel (SCPA)
+# STEP 5 — Configure kernel (SCPA + Mint-safe settings)
 # =============================================================================
 banner "Step 5 — Kernel configuration (SCPA)"
 
@@ -268,32 +328,36 @@ if [[ -f "$KSRC/.config" ]] && grep -q "CONFIG_SECURITY_ACM=y" "$KSRC/.config"; 
     ok "Kernel already configured — skipping."
 else
     step "Generating x86_64 defconfig ..."
-    make -C "$KSRC" ARCH=x86_64 x86_64_defconfig 2>&1 | tail -2
+    make -C "$KSRC" ARCH=x86_64 x86_64_defconfig 2>&1 | tail -3
 
-    step "Applying SCPA pruning and SecureKernel settings ..."
-    python3 - "$KSRC/.config" << 'EOF'
+    step "Applying SCPA pruning, SecureKernel settings, and Mint-safe fixes ..."
+    python3 - "$KSRC/.config" << 'PYEOF'
 import sys, re
 
 path = sys.argv[1]
 cfg  = open(path).read()
 
 def set_opt(cfg, opt, val):
-    p1 = rf'^{re.escape(opt)}=.*$'
-    p2 = rf'^# {re.escape(opt)} is not set$'
+    """Set a kernel config option, handling all three states."""
+    p_set     = rf'^{re.escape(opt)}=.*$'
+    p_not_set = rf'^# {re.escape(opt)} is not set$'
+    p_tristate_not = rf'^# {re.escape(opt)} is not set'
     line = f'{opt}={val}'
-    if re.search(p1, cfg, re.MULTILINE):
-        return re.sub(p1, line, cfg, flags=re.MULTILINE)
-    if re.search(p2, cfg, re.MULTILINE):
-        return re.sub(p2, line, cfg, flags=re.MULTILINE)
+    if re.search(p_set, cfg, re.MULTILINE):
+        return re.sub(p_set, line, cfg, flags=re.MULTILINE)
+    if re.search(p_not_set, cfg, re.MULTILINE):
+        return re.sub(p_not_set, line, cfg, flags=re.MULTILINE)
+    # Not present at all — append
     return cfg + f'\n{line}\n'
 
-# Ubuntu/Mint/Debian defconfig sets these to system cert files which break
-# the build outside the distro's own build environment — clear them.
-cfg = set_opt(cfg, 'CONFIG_SYSTEM_TRUSTED_KEYS',    '""')
-cfg = set_opt(cfg, 'CONFIG_SYSTEM_REVOCATION_KEYS', '""')
-cfg = set_opt(cfg, 'CONFIG_MODULE_SIG_KEY',         '"certs/signing_key.pem"')
+# ── MINT/UBUNTU FIX: clear trusted key paths ────────────────────────────────
+# Ubuntu/Mint defconfig sets these to system cert files which break the build
+# when building outside the distro's own build environment.
+cfg = set_opt(cfg, 'CONFIG_SYSTEM_TRUSTED_KEYS',      '""')
+cfg = set_opt(cfg, 'CONFIG_SYSTEM_REVOCATION_KEYS',   '""')
+cfg = set_opt(cfg, 'CONFIG_MODULE_SIG_KEY',           '"certs/signing_key.pem"')
 
-# SCPA: disable debug/trace/unused
+# ── SCPA: disable debug/trace/unused ────────────────────────────────────────
 for opt in [
     'CONFIG_DEBUG_INFO_BTF', 'CONFIG_DEBUG_INFO_BTF_MODULES',
     'CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT',
@@ -306,24 +370,25 @@ for opt in [
     'CONFIG_BT', 'CONFIG_SOUND', 'CONFIG_HAMRADIO',
     'CONFIG_ATM', 'CONFIG_IPX', 'CONFIG_APPLETALK',
     'CONFIG_PCMCIA', 'CONFIG_FIREWIRE', 'CONFIG_INFINIBAND',
-    # Disable module signing to avoid cert dependency issues
-    'CONFIG_MODULE_SIG', 'CONFIG_MODULE_SIG_FORCE', 'CONFIG_MODULE_SIG_ALL',
-    # Disable IMA/EVM (cert-dependent, not needed for QEMU demo)
+    # Disable module signing (avoids cert dependency issues)
+    'CONFIG_MODULE_SIG', 'CONFIG_MODULE_SIG_FORCE',
+    'CONFIG_MODULE_SIG_ALL',
+    # Disable IMA/EVM (cert-dependent)
     'CONFIG_IMA', 'CONFIG_EVM',
 ]:
     cfg = set_opt(cfg, opt, 'n')
 
-# SCPA: HZ=250 (embedded — fewer timer interrupts)
+# ── SCPA: HZ=250 (fewer timer interrupts — embedded profile) ────────────────
 cfg = set_opt(cfg, 'CONFIG_HZ_1000', 'n')
 cfg = set_opt(cfg, 'CONFIG_HZ_250',  'y')
 cfg = set_opt(cfg, 'CONFIG_HZ',      '250')
 
-# Our three built-in modules
+# ── SecureKernel modules ────────────────────────────────────────────────────
 cfg = set_opt(cfg, 'CONFIG_SECURITY_ACM',   'y')
 cfg = set_opt(cfg, 'CONFIG_NETFILTER_RBPF', 'y')
 cfg = set_opt(cfg, 'CONFIG_MISC_MMOA',      'y')
 
-# Security hardening + network support built-in
+# ── Security hardening + network built-in ───────────────────────────────────
 for opt in [
     'CONFIG_HARDENED_USERCOPY', 'CONFIG_FORTIFY_SOURCE',
     'CONFIG_STACKPROTECTOR_STRONG', 'CONFIG_RANDOMIZE_BASE',
@@ -333,32 +398,42 @@ for opt in [
     'CONFIG_SLAB_FREELIST_RANDOM', 'CONFIG_SLAB_FREELIST_HARDENED',
     'CONFIG_SHUFFLE_PAGE_ALLOCATOR', 'CONFIG_INIT_ON_ALLOC_DEFAULT_ON',
     'CONFIG_SECURITY_YAMA', 'CONFIG_VIRTIO_CONSOLE',
-    # Network: built-in so initramfs can use them without modprobe
+    # Network: built-in so initramfs can use without modprobe
     'CONFIG_VIRTIO_NET', 'CONFIG_NET', 'CONFIG_INET',
     'CONFIG_IP_PNP', 'CONFIG_PACKET', 'CONFIG_UNIX',
     'CONFIG_NETFILTER', 'CONFIG_NF_CONNTRACK',
 ]:
     cfg = set_opt(cfg, opt, 'y')
 
-# Transparent huge pages: madvise only (embedded)
-cfg = set_opt(cfg, 'CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS', 'n')
+# ── THP: madvise only (embedded profile) ────────────────────────────────────
+cfg = set_opt(cfg, 'CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS',  'n')
 cfg = set_opt(cfg, 'CONFIG_TRANSPARENT_HUGEPAGE_MADVISE', 'y')
 
-# Append ACM to LSM list
+# ── Append ACM to LSM list ──────────────────────────────────────────────────
 m = re.search(r'(CONFIG_LSM=")([^"]*?)(")', cfg)
 if m and 'acm' not in m.group(2):
     cfg = re.sub(r'(CONFIG_LSM=")([^"]*?)(")', r'\1\2,acm\3', cfg)
 
 open(path, 'w').write(cfg)
-print('SCPA configuration applied.')
-EOF
+print('SCPA + Mint-safe configuration applied.')
+PYEOF
 
-    step "Resolving configuration dependencies ..."
-    make -C "$KSRC" ARCH=x86_64 olddefconfig 2>&1 | tail -2
+    step "Resolving configuration dependencies (olddefconfig) ..."
+    make -C "$KSRC" ARCH=x86_64 olddefconfig 2>&1 | tail -3
 
-    # Confirm all three modules are set
+    # Verify modules are set
     for sym in CONFIG_SECURITY_ACM CONFIG_NETFILTER_RBPF CONFIG_MISC_MMOA; do
-        grep -q "^${sym}=y" "$KSRC/.config" || warn "$sym not set — check config"
+        if grep -q "^${sym}=y" "$KSRC/.config"; then
+            ok "$sym=y"
+        else
+            warn "$sym not set — check $KSRC/.config"
+        fi
+    done
+
+    # Verify Mint-safe settings applied
+    for sym in CONFIG_SYSTEM_TRUSTED_KEYS CONFIG_SYSTEM_REVOCATION_KEYS; do
+        val=$(grep "^${sym}=" "$KSRC/.config" 2>/dev/null || echo "NOT FOUND")
+        ok "  $sym = $val"
     done
 
     ok "Kernel configured."
@@ -373,13 +448,31 @@ if [[ -f "$BZIMAGE" ]]; then
     ok "bzImage already built: $(du -sh "$BZIMAGE" | cut -f1)"
 else
     step "Compiling — this takes 15–40 minutes depending on hardware ..."
-    make -C "$KSRC" ARCH=x86_64 -j"$JOBS" 2>&1 | \
+    echo -e "  ${YLW}Watch for errors below. Full log → $BUILD_DIR/build.log${NC}"
+    echo ""
+
+    # Run make, tee full output to log, and show filtered progress
+    set +e
+    make -C "$KSRC" ARCH=x86_64 -j"$JOBS" 2>&1 | tee "$BUILD_DIR/build.log" | \
         grep --line-buffered -E \
-            "^  (CC|LD|AR|AS|LINK|BUILD|Kernel)|error:|warning:.*error" || true
+            "^  (CC|LD|AR|AS|LINK|BUILD|Kernel)|[Ee]rror:|[Ff]atal:|warning:.*error" || true
+    MAKE_EXIT=${PIPESTATUS[0]}
+    set -e
 
-    [[ -f "$BZIMAGE" ]] || die "Compilation failed — bzImage not produced. Check build output."
+    if [[ $MAKE_EXIT -ne 0 ]]; then
+        echo ""
+        echo -e "${RED}============================================================${NC}"
+        echo -e "${RED}  Compilation FAILED (exit $MAKE_EXIT)${NC}"
+        echo -e "${RED}============================================================${NC}"
+        echo ""
+        echo -e "  Last 40 lines of build log:"
+        tail -40 "$BUILD_DIR/build.log"
+        echo ""
+        die "Fix the errors above and re-run. Full log: $BUILD_DIR/build.log"
+    fi
 
-    # Confirm all three modules compiled
+    [[ -f "$BZIMAGE" ]] || die "make succeeded but bzImage not found. Check $BUILD_DIR/build.log"
+
     for mod in "security/acm/acm_lsm.o" "net/netfilter/rbpf.o" "drivers/misc/mmoa.o"; do
         [[ -f "$KSRC/$mod" ]] && ok "Compiled: $mod" || warn "Missing: $mod"
     done
@@ -397,19 +490,21 @@ build_initramfs() {
     mkdir -p "$INITRD"/{bin,sbin,etc,proc,sys,dev,tmp,root,lib,lib64}
     mkdir -p "$INITRD/lib/x86_64-linux-gnu"
 
-    # Copy busybox
-    local BB
-    BB=$(command -v busybox) || die "busybox not found"
-    cp "$BB" "$INITRD/bin/busybox"
+    # Copy busybox (static binary preferred — no library deps)
+    cp "$BUSYBOX_BIN" "$INITRD/bin/busybox"
+    chmod +x "$INITRD/bin/busybox"
 
-    # Copy shared libraries needed by busybox
-    local INTERP
-    INTERP=$(ldd "$BB" 2>/dev/null | grep "ld-linux" | awk '{print $1}' | head -1)
-    [[ -f "$INTERP" ]] && cp "$INTERP" "$INITRD/lib64/"
-
-    for lib in $(ldd "$BB" 2>/dev/null | grep "=> /" | awk '{print $3}'); do
-        [[ -f "$lib" ]] && cp "$lib" "$INITRD/lib/x86_64-linux-gnu/" 2>/dev/null || true
-    done
+    # Only copy shared libs if not a static binary
+    if ldd "$BUSYBOX_BIN" 2>&1 | grep -q "not a dynamic executable"; then
+        ok "BusyBox is statically linked — no library copy needed."
+    else
+        local INTERP
+        INTERP=$(ldd "$BUSYBOX_BIN" 2>/dev/null | grep "ld-linux" | awk '{print $1}' | head -1 || true)
+        [[ -n "$INTERP" && -f "$INTERP" ]] && cp "$INTERP" "$INITRD/lib64/" || true
+        for lib in $(ldd "$BUSYBOX_BIN" 2>/dev/null | grep "=> /" | awk '{print $3}'); do
+            [[ -f "$lib" ]] && cp "$lib" "$INITRD/lib/x86_64-linux-gnu/" 2>/dev/null || true
+        done
+    fi
 
     # Busybox applet symlinks
     for cmd in sh ash ls cat echo ps mount umount dmesg insmod rmmod lsmod \
@@ -422,7 +517,33 @@ build_initramfs() {
     done
 
     # Copy init script
-    cp "$SCRIPT_DIR/linux-build/initramfs/init" "$INITRD/init"
+    if [[ -f "$SCRIPT_DIR/linux-build/initramfs/init" ]]; then
+        cp "$SCRIPT_DIR/linux-build/initramfs/init" "$INITRD/init"
+    else
+        # Fallback init script
+        cat > "$INITRD/init" << 'INITEOF'
+#!/bin/sh
+mount -t proc     none /proc
+mount -t sysfs    none /sys
+mount -t devtmpfs none /dev 2>/dev/null || mdev -s
+
+echo ""
+echo "============================================"
+echo "  SecureKernel — Linux 6.6.140 LTS"
+echo "  IT B TEAM 7 | Gnanamani College of Tech"
+echo "============================================"
+echo ""
+echo "SecureKernel modules:"
+dmesg 2>/dev/null | grep -E "ACM|MMOA|RBPF" || echo "  (check dmesg)"
+echo ""
+echo "Try: cat /proc/mmoa_stats"
+echo "     cat /proc/rbpf_rules"
+echo "     cat /proc/acm_policy"
+echo "     dmesg | grep -E 'ACM|MMOA|RBPF'"
+echo ""
+exec /bin/sh
+INITEOF
+    fi
     chmod +x "$INITRD/init"
 
     ok "Initramfs root filesystem ready."
@@ -435,7 +556,7 @@ pack_initramfs() {
     ok "Initramfs packed: $(du -sh "$CPIO" | cut -f1)"
 }
 
-if [[ -f "$CPIO" && "$CPIO" -nt "$INITRD/init" ]]; then
+if [[ -f "$CPIO" && -f "$INITRD/init" && "$CPIO" -nt "$INITRD/init" ]]; then
     ok "Initramfs already packed: $(du -sh "$CPIO" | cut -f1)"
 else
     build_initramfs
@@ -443,13 +564,34 @@ else
 fi
 
 # =============================================================================
-# STEP 8 — Launch QEMU
+# Done — print summary or launch QEMU
 # =============================================================================
-banner "Step 8 — Launching SecureKernel in QEMU"
+banner "Build Complete!"
 
 echo -e "  Kernel    : ${BOLD}$BZIMAGE${NC} ($(du -sh "$BZIMAGE" | cut -f1))"
 echo -e "  Initramfs : ${BOLD}$CPIO${NC} ($(du -sh "$CPIO" | cut -f1))"
 echo ""
+
+if [[ "${NO_QEMU:-0}" == "1" ]]; then
+    ok "NO_QEMU=1 — skipping QEMU launch."
+    echo ""
+    echo -e "  To boot manually:"
+    echo -e "    ${BOLD}$QEMU_BIN \\${NC}"
+    echo -e "      ${BOLD}-kernel $BZIMAGE \\${NC}"
+    echo -e "      ${BOLD}-initrd $CPIO \\${NC}"
+    echo -e "      ${BOLD}-append \"console=ttyS0 loglevel=4 lsm=capability,yama,acm nokaslr\" \\${NC}"
+    echo -e "      ${BOLD}-m 512M -smp 2 -nographic -no-reboot${NC}"
+    echo ""
+    echo -e "  To install system-wide:"
+    echo -e "    ${BOLD}sudo bash $SCRIPT_DIR/install.sh${NC}"
+    exit 0
+fi
+
+# =============================================================================
+# STEP 8 — Launch QEMU
+# =============================================================================
+banner "Step 8 — Launching SecureKernel in QEMU"
+
 echo -e "${YLW}  Press Ctrl-A then X to quit QEMU${NC}"
 echo -e "${YLW}  At the shell, try:${NC}"
 echo -e "    ${CYN}cat /proc/mmoa_stats${NC}"
